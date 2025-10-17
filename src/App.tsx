@@ -11,15 +11,6 @@ const loadYouTubeAPI = () => {
   document.head.appendChild(tag);
 };
 
-// small helper to download text files (CSV/JSON) from browser
-const downloadText = (filename: string, text: string) => {
-  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = filename; a.click();
-  URL.revokeObjectURL(url);
-};
-
 // --- Types ---
 interface Segment { word: string; start: number; end: number; }
 
@@ -40,50 +31,25 @@ const parseTime = (raw: string): number => {
   return Number(s) || 0;
 };
 
-// CSV parser: word,start,end (header optional)
-const parseCSV = (text: string): Segment[] => {
-  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-  if (lines.length === 0) return [];
-  // Skip header if it contains non-time tokens
-  const startIdx = /word|start|end|単語/i.test(lines[0]) ? 1 : 0;
-  const rows = lines.slice(startIdx);
-  const segs: Segment[] = [];
-  for (const line of rows) {
-    const parts = line.split(/,|\t/).map(x => x.trim());
-    if (parts.length < 3) continue;
-    const [word, start, end] = parts;
-    const s = parseTime(start);
-    const e = parseTime(end);
-    if (!word) continue;
-    if (Number.isFinite(s) && Number.isFinite(e) && e > s) segs.push({ word, start: s, end: e });
-  }
-  return segs;
-};
-
 // Storage keys per video
-const storeKey = (videoId: string) => `yt-word-loop:v1:${videoId}`;
+const storeKey = (videoId: string) => `yt-word-loop:v3:${videoId}`;
 
 export default function App() {
-  // ← デフォルト動画URLを指定
-  const [videoInput, setVideoInput] = useState("https://www.youtube.com/watch?v=Rp5WVODIGZ0");
   const [videoId, setVideoId] = useState<string>("");
-  const [csv, setCsv] = useState<string>("word,start,end\napple,12.3,14.1\nbanana,25,27.2\ncat,40.5,42\ndevelopment,1:03,1:07.5");
   const [segments, setSegments] = useState<Segment[]>([]);
   const [selectedWords, setSelectedWords] = useState<string[]>([]);
-  const [knownWords, setKnownWords] = useState<Record<string, boolean>>({});
+  const [knownWords, setKnownWords] = useState<Record<string, boolean>>({}); // level==1 → known
   const [rate, setRate] = useState<number>(1);
   const [loops, setLoops] = useState<number>(2);
   const [autoAdvance, setAutoAdvance] = useState<boolean>(true);
   const [pipSupported, setPipSupported] = useState<boolean>(false);
+  const [windowSec, setWindowSec] = useState<number>(1.8); // 秒数からこの長さを再生
 
   const playerRef = useRef<any>(null);
   const iframeWrap = useRef<HTMLDivElement>(null);
   const pollingRef = useRef<any>(null);
   const currentRef = useRef<{ idx: number; loop: number } | null>(null);
-
-  // hidden file inputs
   const csvFileInput = useRef<HTMLInputElement>(null);
-  const knownFileInput = useRef<HTMLInputElement>(null);
 
   // Extract videoId from various formats
   const extractVideoId = (urlOrId: string): string => {
@@ -100,7 +66,6 @@ export default function App() {
   // Load YT API
   useEffect(() => {
     loadYouTubeAPI();
-    // PiP availability (not guaranteed)
     setPipSupported(!!(document as any).pictureInPictureEnabled);
   }, []);
 
@@ -121,9 +86,6 @@ export default function App() {
         onReady: () => {
           try { playerRef.current.setPlaybackRate(rate); } catch {}
         },
-        onStateChange: (e: any) => {
-          // Handle END / PAUSE if needed
-        }
       }
     });
   };
@@ -137,7 +99,6 @@ export default function App() {
       }
     }, 100);
     return () => clearInterval(tm);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [videoId]);
 
   // Load from storage on video change
@@ -148,9 +109,9 @@ export default function App() {
       if (raw) {
         const saved = JSON.parse(raw);
         setKnownWords(saved.knownWords || {});
-        if (saved.csv) setCsv(saved.csv);
         if (saved.segments) setSegments(saved.segments);
         if (saved.selectedWords) setSelectedWords(saved.selectedWords);
+        if (typeof saved.windowSec === 'number') setWindowSec(saved.windowSec);
       }
     } catch {}
   }, [videoId]);
@@ -158,65 +119,87 @@ export default function App() {
   // Persist
   useEffect(() => {
     if (!videoId) return;
-    const data = { knownWords, csv, segments, selectedWords };
+    const data = { knownWords, segments, selectedWords, windowSec };
     try { localStorage.setItem(storeKey(videoId), JSON.stringify(data)); } catch {}
-  }, [videoId, knownWords, csv, segments, selectedWords]);
+  }, [videoId, knownWords, segments, selectedWords, windowSec]);
 
-  // Parse CSV button handler
-  const applyCSV = () => {
-    const segs = parseCSV(csv);
-    setSegments(segs);
-    const words = segs.map(s => s.word);
-    setSelectedWords(words.filter(w => !knownWords[w]));
+  // --- CSV upload (new format only) ---
+  // 1行目: URL/ID, 2行目: 列名(例: 秒数,見出し語,習熟度), 3行目以降: 秒数,見出し語(任意),習熟度(空白=0)
+  const parseUploadedCSV = (text: string) => {
+    const lines = text.split(/\r?\n/).map(l => l.trim());
+    // drop BOM-only or empty lines at top/bottom
+    const cleaned = lines.filter(l => l && l !== "\ufeff");
+    if (cleaned.length < 3) throw new Error("CSVは3行以上（URL+ヘッダ+データ）にしてください。");
+
+    const urlLine = cleaned[0].split(',')[0].trim();
+    const vid = extractVideoId(urlLine);
+    if (!vid) throw new Error("1行目に有効なYouTube URL/IDを入力してください。");
+
+    const dataLines = cleaned.slice(2); // skip header line entirely
+
+    const rows: { t: number; word: string; level: number }[] = [];
+    for (const line of dataLines) {
+      const parts = line.split(/,|\t/).map(s => s.trim());
+      if (!parts[0]) continue; // 秒数必須
+      const t = parseTime(parts[0]);
+      const word = (parts[1] || ``).trim();      // 任意
+      const lvlRaw = (parts[2] ?? "").trim();    // 空白は0
+      const level = lvlRaw === "" ? 0 : (parseInt(lvlRaw, 10) ? 1 : 0);
+      if (!Number.isFinite(t)) continue;
+      rows.push({ t, word, level });
+    }
+
+    // rows -> segments (windowSec)
+    const segs: Segment[] = rows.map(r => ({
+      word: r.word || `t=${r.t}`,
+      start: r.t,
+      end: r.t + Math.max(0.3, windowSec),
+    }));
+
+    // knownWords: level==1
+    const kw: Record<string, boolean> = {};
+    rows.forEach(r => { const w = r.word || `t=${r.t}`; if (r.level === 1) kw[w] = true; });
+
+    return { vid, segs, kw };
   };
 
-  // CSV: <input type="file"> から読み込み
   const onCsvFileSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
     reader.onload = () => {
-      const text = String(reader.result || '');
-      setCsv(text);
-      const segs = parseCSV(text);
-      setSegments(segs);
-      const words = segs.map(s => s.word);
-      setSelectedWords(words.filter(w => !knownWords[w]));
-    };
-    reader.readAsText(file);
-    e.currentTarget.value = '';
-  };
-
-  // 既習データ: JSONダウンロード
-  const exportKnownWords = () => {
-    const payload = {
-      videoId,
-      knownWords,
-      updatedAt: new Date().toISOString(),
-      app: 'yt-word-loop-mvp',
-    };
-    downloadText(`known-${videoId || 'unknown'}.json`, JSON.stringify(payload, null, 2));
-  };
-
-  // 既習データ: JSONから復元
-  const onKnownImportSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
       try {
-        const data = JSON.parse(String(reader.result || '{}'));
-        if (data && typeof data.knownWords === 'object') {
-          setKnownWords(data.knownWords || {});
-        } else {
-          alert('JSONにknownWordsが見つかりません');
-        }
-      } catch {
-        alert('JSONの読み込みに失敗しました');
+        const text = String(reader.result || '');
+        const { vid, segs, kw } = parseUploadedCSV(text);
+        setVideoId(vid); // 自動ロード
+        setSegments(segs);
+        setKnownWords(kw);
+        setSelectedWords(segs.map(s => s.word).filter(w => !kw[w]));
+      } catch (err: any) {
+        alert(err?.message || 'CSVの読み込みに失敗しました');
       }
     };
     reader.readAsText(file);
     e.currentTarget.value = '';
+  };
+
+  // CSV download (same format)
+  const downloadCSV = () => {
+    const url = videoId ? `https://www.youtube.com/watch?v=${videoId}` : '';
+    const lines: string[] = [];
+    lines.push(url);
+    lines.push('秒数,見出し語,習熟度');
+    const masteryOf = (w: string) => (knownWords[w] ? 1 : 0);
+    segments.forEach(seg => {
+      lines.push(`${seg.start},${seg.word || ''},${masteryOf(seg.word)}`);
+    });
+    const csvText = lines.join('\n');
+    const filename = `segments-${videoId || 'data'}.csv`;
+    const blob = new Blob([csvText], { type: 'text/csv;charset=utf-8' });
+    const urlObj = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = urlObj; a.download = filename; a.click();
+    URL.revokeObjectURL(urlObj);
   };
 
   // Controls
@@ -284,71 +267,55 @@ export default function App() {
 
   const knownCount = useMemo(() => Object.values(knownWords).filter(Boolean).length, [knownWords]);
 
-  // Attempt PiP (works only if user interacted and browser allows)
-  const tryPiP = async () => {
-    const iframe = iframeWrap.current?.querySelector('iframe') as HTMLIFrameElement | null;
-    if (!iframe) return;
-    // @ts-ignore - non-standard but widely supported via experimental API when allowed
-    const video: HTMLVideoElement | undefined = (iframe as any)?.contentWindow?.document?.querySelector('video');
-    try {
-      if (video && (video as any).requestPictureInPicture) {
-        await (video as any).requestPictureInPicture();
-      }
-    } catch {}
-  };
-
   // UI
   return (
     <div className="min-h-screen bg-white text-gray-900 px-4 pb-28">
       <div className="max-w-screen-sm mx-auto">
         <h1 className="text-2xl font-bold mt-4">YouTube 単語ループ（スマホ向けMVP）</h1>
-        <p className="text-sm text-gray-600 mt-1">※ 初回は必ず画面をタップして再生開始してください（自動再生ポリシー対策）。第三者動画の利用は権利に注意。</p>
+        <p className="text-sm text-gray-600 mt-1">
+          CSV形式：1行目=動画URL/ID、2行目=列名（例：秒数,見出し語,習熟度）、3行目以降=データ行。見出し語は空でもOK、習熟度の空白は0（未習）。
+        </p>
 
-        {/* Video input */}
-        <div className="mt-4 space-y-2">
-          <label className="text-sm font-medium">動画URLまたはID</label>
-          <div className="flex gap-2">
-            <input
-              className="flex-1 border rounded-xl px-3 py-2"
-              placeholder="https://www.youtube.com/watch?v=..."
-              value={videoInput}
-              onChange={e => setVideoInput(e.target.value)}
-            />
-            <button
-              className="rounded-xl px-4 py-2 bg-black text-white"
-              onClick={() => setVideoId(extractVideoId(videoInput))}
-            >読み込む</button>
+        {/* CSV Only: Upload & Download */}
+        <div className="mt-4 p-3 border rounded-2xl">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <div className="text-sm font-medium">CSVをアップロード</div>
+            <div className="flex gap-2">
+              <input ref={csvFileInput} type="file" accept=".csv,text/csv" className="hidden" onChange={onCsvFileSelected} />
+              <button className="rounded-xl px-4 py-2 border" onClick={() => csvFileInput.current?.click()}>CSVファイルを選択</button>
+              <button className="rounded-xl px-4 py-2 border" onClick={downloadCSV} disabled={!segments.length}>CSVをダウンロード</button>
+            </div>
+          </div>
+          <div className="mt-2 text-xs text-gray-500">
+            <p>例：</p>
+            <pre className="whitespace-pre-wrap bg-gray-50 p-2 rounded-md border text-[12px]">
+{`https://www.youtube.com/watch?v=Rp5WVODIGZ0
+秒数,見出し語,習熟度
+12.3,apple,0
+25,banana,1
+40.5,cat,0
+63,development,0`}
+            </pre>
+          </div>
+          <div className="mt-3 flex items-center gap-3 text-sm">
+            <label className="flex items-center gap-2">
+              <span className="text-gray-600">ウィンドウ長（秒）</span>
+              <input
+                type="number"
+                min={0.3}
+                step={0.1}
+                value={windowSec}
+                onChange={e => setWindowSec(Math.max(0.3, parseFloat(e.target.value || '1.8')))}
+                className="w-24 border rounded-xl px-3 py-1"
+              />
+            </label>
+            <span className="text-gray-500">※ 各行の秒数からこの長さだけ再生</span>
           </div>
         </div>
 
         {/* Player */}
         <div className="mt-4 rounded-2xl overflow-hidden border">
           <div ref={iframeWrap} className="w-full"></div>
-        </div>
-
-        {/* CSV input */}
-        <div className="mt-4">
-          <div className="flex items-center justify-between">
-            <label className="text-sm font-medium">区間リスト CSV（word,start,end）</label>
-            <div className="flex items-center gap-2">
-              <button className="text-xs underline" onClick={() => setCsv("word,start,end\napple,12.3,14.1\nbanana,25,27.2\ncat,40.5,42\ndevelopment,1:03,1:07.5")}>サンプル</button>
-              <button className="text-xs underline" onClick={() => downloadText(`segments-${videoId || 'sample'}.csv`, csv)}>CSVをダウンロード</button>
-            </div>
-          </div>
-          <textarea
-            className="w-full border rounded-xl p-3 h-32 mt-1"
-            value={csv}
-            onChange={e => setCsv(e.target.value)}
-          />
-          <div className="flex flex-wrap gap-2 mt-2">
-            <button className="rounded-xl px-4 py-2 border" onClick={applyCSV}>CSVを反映</button>
-            <button className="rounded-xl px-4 py-2 border" onClick={() => setSelectedWords(segments.map(s => s.word))}>全選択</button>
-            <button className="rounded-xl px-4 py-2 border" onClick={() => setSelectedWords(segments.filter(s => !knownWords[s.word]).map(s => s.word))}>苦手のみ選択</button>
-
-            {/* CSV ファイル読み込み */}
-            <input ref={csvFileInput} type="file" accept=".csv,text/csv" className="hidden" onChange={onCsvFileSelected} />
-            <button className="rounded-xl px-4 py-2 border" onClick={() => csvFileInput.current?.click()}>CSVファイルから読み込み</button>
-          </div>
         </div>
 
         {/* Controls */}
@@ -375,7 +342,7 @@ export default function App() {
           <button className="rounded-2xl py-3 border" onClick={handleNext}>次へ</button>
           <button className="rounded-2xl py-3 border col-span-2" onClick={stopAll}>一時停止</button>
           {pipSupported ? (
-            <button className="rounded-2xl py-3 border" onClick={tryPiP}>PiP</button>
+            <button className="rounded-2xl py-3 border">PiP</button>
           ) : (
             <button className="rounded-2xl py-3 border opacity-60" disabled>PiP非対応</button>
           )}
@@ -411,22 +378,9 @@ export default function App() {
 
         {/* Footer tips */}
         <div className="mt-8 text-xs text-gray-500 pb-8">
+          <p>・CSV以外の入力欄は廃止しました。1行目URL/ID、2行目ヘッダ、3行目以降データでアップロードしてください。</p>
           <p>・広告や埋め込み不可設定の動画では制御が中断されることがあります。</p>
           <p>・第三者のコンテンツを利用する際は権利・利用規約にご注意ください。自作教材や許諾を得た動画の利用を推奨します。</p>
-          <p>・バックグラウンド再生はアカウントやOS仕様の影響を受けます（Premium推奨、PiP併用など）。</p>
-        </div>
-
-        {/* Known words backup/restore */}
-        <div className="mt-4 p-3 border rounded-2xl">
-          <div className="font-medium mb-2 text-sm">既習データのバックアップ / 復元</div>
-          <div className="flex flex-wrap gap-2">
-            <button className="rounded-xl px-4 py-2 border" onClick={exportKnownWords}>既習データをダウンロード（JSON）</button>
-            <input ref={knownFileInput} type="file" accept="application/json,.json" className="hidden" onChange={onKnownImportSelected} />
-            <button className="rounded-xl px-4 py-2 border" onClick={() => knownFileInput.current?.click()}>
-              JSONから復元
-            </button>
-          </div>
-          <p className="text-xs text-gray-500 mt-2">※ ブラウザのローカルストレージに自動保存されています（動画IDごと）。別端末へ移行するときはJSONでエクスポート→インポートしてください。</p>
         </div>
       </div>
     </div>
