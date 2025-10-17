@@ -11,6 +11,15 @@ const loadYouTubeAPI = () => {
   document.head.appendChild(tag);
 };
 
+// small helper to download text files (CSV/JSON) from browser
+const downloadText = (filename: string, text: string) => {
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+};
+
 // --- Types ---
 interface Segment { word: string; start: number; end: number; }
 
@@ -55,7 +64,8 @@ const parseCSV = (text: string): Segment[] => {
 const storeKey = (videoId: string) => `yt-word-loop:v1:${videoId}`;
 
 export default function App() {
-  const [videoInput, setVideoInput] = useState("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+  // ← デフォルト動画URLを指定
+  const [videoInput, setVideoInput] = useState("https://www.youtube.com/watch?v=Rp5WVODIGZ0");
   const [videoId, setVideoId] = useState<string>("");
   const [csv, setCsv] = useState<string>("word,start,end\napple,12.3,14.1\nbanana,25,27.2\ncat,40.5,42\ndevelopment,1:03,1:07.5");
   const [segments, setSegments] = useState<Segment[]>([]);
@@ -71,6 +81,10 @@ export default function App() {
   const pollingRef = useRef<any>(null);
   const currentRef = useRef<{ idx: number; loop: number } | null>(null);
 
+  // hidden file inputs
+  const csvFileInput = useRef<HTMLInputElement>(null);
+  const knownFileInput = useRef<HTMLInputElement>(null);
+
   // Extract videoId from various formats
   const extractVideoId = (urlOrId: string): string => {
     const s = urlOrId.trim();
@@ -79,7 +93,6 @@ export default function App() {
       const u = new URL(s);
       if (u.hostname.includes("youtu.be")) return u.pathname.replace("/", "");
       if (u.searchParams.get("v")) return u.searchParams.get("v") || "";
-      // youtu.be with extra
     } catch {}
     return s;
   };
@@ -157,6 +170,55 @@ export default function App() {
     setSelectedWords(words.filter(w => !knownWords[w]));
   };
 
+  // CSV: <input type="file"> から読み込み
+  const onCsvFileSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = String(reader.result || '');
+      setCsv(text);
+      const segs = parseCSV(text);
+      setSegments(segs);
+      const words = segs.map(s => s.word);
+      setSelectedWords(words.filter(w => !knownWords[w]));
+    };
+    reader.readAsText(file);
+    e.currentTarget.value = '';
+  };
+
+  // 既習データ: JSONダウンロード
+  const exportKnownWords = () => {
+    const payload = {
+      videoId,
+      knownWords,
+      updatedAt: new Date().toISOString(),
+      app: 'yt-word-loop-mvp',
+    };
+    downloadText(`known-${videoId || 'unknown'}.json`, JSON.stringify(payload, null, 2));
+  };
+
+  // 既習データ: JSONから復元
+  const onKnownImportSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(String(reader.result || '{}'));
+        if (data && typeof data.knownWords === 'object') {
+          setKnownWords(data.knownWords || {});
+        } else {
+          alert('JSONにknownWordsが見つかりません');
+        }
+      } catch {
+        alert('JSONの読み込みに失敗しました');
+      }
+    };
+    reader.readAsText(file);
+    e.currentTarget.value = '';
+  };
+
   // Controls
   const playSegmentAt = (index: number) => {
     if (!playerRef.current || index < 0 || index >= selectedWords.length) return;
@@ -229,9 +291,6 @@ export default function App() {
     // @ts-ignore - non-standard but widely supported via experimental API when allowed
     const video: HTMLVideoElement | undefined = (iframe as any)?.contentWindow?.document?.querySelector('video');
     try {
-      // Most browsers disallow cross-origin access; PiP may require built-in button instead.
-      // We keep this as a best-effort hook; gracefully no-op on failure.
-      // Some Chromium builds expose requestPictureInPicture on the HTMLVideoElement.
       if (video && (video as any).requestPictureInPicture) {
         await (video as any).requestPictureInPicture();
       }
@@ -271,17 +330,24 @@ export default function App() {
         <div className="mt-4">
           <div className="flex items-center justify-between">
             <label className="text-sm font-medium">区間リスト CSV（word,start,end）</label>
-            <button className="text-xs underline" onClick={() => setCsv("word,start,end\napple,12.3,14.1\nbanana,25,27.2\ncat,40.5,42\ndevelopment,1:03,1:07.5")}>サンプル</button>
+            <div className="flex items-center gap-2">
+              <button className="text-xs underline" onClick={() => setCsv("word,start,end\napple,12.3,14.1\nbanana,25,27.2\ncat,40.5,42\ndevelopment,1:03,1:07.5")}>サンプル</button>
+              <button className="text-xs underline" onClick={() => downloadText(`segments-${videoId || 'sample'}.csv`, csv)}>CSVをダウンロード</button>
+            </div>
           </div>
           <textarea
             className="w-full border rounded-xl p-3 h-32 mt-1"
             value={csv}
             onChange={e => setCsv(e.target.value)}
           />
-          <div className="flex gap-2 mt-2">
+          <div className="flex flex-wrap gap-2 mt-2">
             <button className="rounded-xl px-4 py-2 border" onClick={applyCSV}>CSVを反映</button>
             <button className="rounded-xl px-4 py-2 border" onClick={() => setSelectedWords(segments.map(s => s.word))}>全選択</button>
             <button className="rounded-xl px-4 py-2 border" onClick={() => setSelectedWords(segments.filter(s => !knownWords[s.word]).map(s => s.word))}>苦手のみ選択</button>
+
+            {/* CSV ファイル読み込み */}
+            <input ref={csvFileInput} type="file" accept=".csv,text/csv" className="hidden" onChange={onCsvFileSelected} />
+            <button className="rounded-xl px-4 py-2 border" onClick={() => csvFileInput.current?.click()}>CSVファイルから読み込み</button>
           </div>
         </div>
 
@@ -348,6 +414,19 @@ export default function App() {
           <p>・広告や埋め込み不可設定の動画では制御が中断されることがあります。</p>
           <p>・第三者のコンテンツを利用する際は権利・利用規約にご注意ください。自作教材や許諾を得た動画の利用を推奨します。</p>
           <p>・バックグラウンド再生はアカウントやOS仕様の影響を受けます（Premium推奨、PiP併用など）。</p>
+        </div>
+
+        {/* Known words backup/restore */}
+        <div className="mt-4 p-3 border rounded-2xl">
+          <div className="font-medium mb-2 text-sm">既習データのバックアップ / 復元</div>
+          <div className="flex flex-wrap gap-2">
+            <button className="rounded-xl px-4 py-2 border" onClick={exportKnownWords}>既習データをダウンロード（JSON）</button>
+            <input ref={knownFileInput} type="file" accept="application/json,.json" className="hidden" onChange={onKnownImportSelected} />
+            <button className="rounded-xl px-4 py-2 border" onClick={() => knownFileInput.current?.click()}>
+              JSONから復元
+            </button>
+          </div>
+          <p className="text-xs text-gray-500 mt-2">※ ブラウザのローカルストレージに自動保存されています（動画IDごと）。別端末へ移行するときはJSONでエクスポート→インポートしてください。</p>
         </div>
       </div>
     </div>
