@@ -322,7 +322,6 @@ export default function App() {
     setDatasetList(next);
     saveIndex(next);
     deleteDataset(id);
-    // 動画表示中に消した場合の軽い後始末（基本は選択画面で削除する想定）
     if (activeId === id) {
       setActiveId(null);
       setVideoId("");
@@ -393,33 +392,15 @@ export default function App() {
     }, 120);
   };
 
-  /** 再生制御 */
-  const stopAll = () => {
-    clearInterval(pollingRef.current);
-    pollingRef.current = null;
-    currentRef.current = null;
-    try {
-      playerRef.current?.pauseVideo?.();
-    } catch {}
-  };
+  /** 再生制御（シンプル化：未習を再生のみ） */
   const handlePlayUnknown = () => {
     if (unknownWords.length === 0) return;
     playSequenceFrom(0);
   };
-  const handleNext = () => {
-    const cur = currentRef.current;
-    if (!cur) return;
-    playSequenceFrom(cur.idx + 1);
-  };
-  const handlePrev = () => {
-    const cur = currentRef.current;
-    if (!cur) return;
-    playSequenceFrom(Math.max(0, cur.idx - 1));
-  };
 
-  /** 既知化（未知→既知のみ） */
-  const markKnown = (w: string) => {
-    setKnownWords((prev) => (prev[w] ? prev : { ...prev, [w]: true }));
+  /** ✅ 既知トグル（既知⇄未知） */
+  const toggleKnown = (w: string) => {
+    setKnownWords((prev) => ({ ...prev, [w]: !prev[w] }));
   };
 
   const knownCount = useMemo(
@@ -559,7 +540,7 @@ export default function App() {
                   <li>見出し語は空でもOK。習熟度は空白=0(未習)／1(既知)。</li>
                   <li>アップ後、一覧の行をタップ → 確認で学習開始。</li>
                   <li>学習画面下の一覧で単語名をタップすると、その位置へジャンプします。</li>
-                  <li>「知ってる」ボタンで未知→既知に切替。既知には戻しません。</li>
+                  <li>「知ってる」ボタンで未知⇄既知を切替できます。</li>
                   <li>未習のみを自動で順送り再生します（各単語のループ回数は設定可能）。</li>
                   <li>保存はブラウザのローカルストレージを利用します。</li>
                 </ul>
@@ -606,25 +587,8 @@ export default function App() {
               >
                 未習を再生
               </button>
-              <button className="rounded-2xl py-3 border" onClick={handlePrev}>
-                前へ
-              </button>
-              <button className="rounded-2xl py-3 border" onClick={handleNext}>
-                次へ
-              </button>
-              <button
-                className="rounded-2xl py-3 border col-span-2"
-                onClick={stopAll}
-              >
-                一時停止
-              </button>
-              {pipSupported ? (
-                <button className="rounded-2xl py-3 border">PiP</button>
-              ) : (
-                <button className="rounded-2xl py-3 border opacity-60" disabled>
-                  PiP非対応
-                </button>
-              )}
+              {/* ▼ 「前へ」「次へ」「一時停止」ボタンを削除しました */}
+              <div className="col-span-2" />
             </div>
 
             {/* Words list → 2列（左=単語名 / 右=知ってる） */}
@@ -659,11 +623,10 @@ export default function App() {
                         </button>
                         <button
                           className={`w-9 h-9 rounded-full border flex items-center justify-center ${
-                            known ? "bg-gray-100 opacity-70" : "bg-amber-100"
+                            known ? "bg-gray-100" : "bg-amber-100"
                           }`}
-                          onClick={() => markKnown(key)}
-                          disabled={known}
-                          title={known ? "既に既知" : "既知にする"}
+                          onClick={() => toggleKnown(key)}
+                          title={known ? "未知に戻す" : "知ってるにする"}
                         >
                           <span className="material-symbols-outlined text-[18px]">
                             {known ? "task_alt" : "radio_button_unchecked"}
