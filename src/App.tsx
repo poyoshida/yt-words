@@ -29,7 +29,7 @@ const loadYouTubeAPI = () => {
 interface Segment {
   word: string; // 単語名（空でもOK）
   start: number; // 秒
-  end: number; // 秒（start + windowSec）
+  end: number;   // 秒（次の開始時刻 - EPS or フォールバック）
 }
 interface DatasetMeta {
   id: string;
@@ -67,6 +67,8 @@ const parseTime = (raw: string): number => {
  *  1行目: URL/ID
  *  2行目: 列名（例: 秒数,見出し語,習熟度）
  *  3行目以降: 秒数,見出し語(任意),習熟度(空白=0)
+ *
+ * 変更点：end は「次の行の開始秒 - 0.05s」。最終行のみ windowSec（最小 0.3s）でフォールバック。
  */
 const parseUploadedCSV = (text: string, windowSec: number) => {
   const BOM = String.fromCharCode(65279);
@@ -97,11 +99,16 @@ const parseUploadedCSV = (text: string, windowSec: number) => {
 
   rows.sort((a, b) => a.t - b.t);
 
-  const segments: Segment[] = rows.map((r) => ({
-    word: r.word || ``,
-    start: r.t,
-    end: r.t + Math.max(0.3, windowSec),
-  }));
+  const EPS = 0.05;
+  const segments: Segment[] = rows.map((r, i) => {
+    const start = r.t;
+    const nextStart = rows[i + 1]?.t;
+    const end = Number.isFinite(nextStart)
+      ? Math.max(start, (nextStart as number) - EPS)
+      : start + Math.max(0.3, windowSec);
+    return { word: r.word || ``, start, end };
+  });
+
   const known: Record<string, boolean> = {};
   rows.forEach((r) => {
     const w = r.word || `t=${r.t}`;
@@ -187,13 +194,15 @@ export default function App() {
   const [videoId, setVideoId] = useState("");
   const [segments, setSegments] = useState<Segment[]>([]);
   const [knownWords, setKnownWords] = useState<Record<string, boolean>>({});
-  const [loops, setLoops] = useState(2);
   const [pipSupported, setPipSupported] = useState(false);
+
+  // 表示・再生対象のトグル：true=未習のみ / false=すべて
+  const [unknownOnly, setUnknownOnly] = useState<boolean>(true);
 
   const playerRef = useRef<any>(null);
   const iframeWrap = useRef<HTMLDivElement>(null);
   const pollingRef = useRef<any>(null);
-  const currentRef = useRef<{ idx: number; loop: number } | null>(null);
+  const currentRef = useRef<{ idx: number } | null>(null);
   const csvFileInput = useRef<HTMLInputElement>(null);
 
   /** 起動 */
@@ -209,9 +218,7 @@ export default function App() {
     if (!iframeWrap.current || !videoId) return;
     if (!(window as any).YT || !(window as any).YT.Player) return;
     if (playerRef.current) {
-      try {
-        playerRef.current.destroy();
-      } catch {}
+      try { playerRef.current.destroy(); } catch {}
       playerRef.current = null;
     }
     playerRef.current = new (window as any).YT.Player(iframeWrap.current, {
@@ -221,9 +228,7 @@ export default function App() {
       playerVars: { controls: 1, rel: 0, modestbranding: 1 },
       events: {
         onReady: () => {
-          try {
-            playerRef.current.setPlaybackRate(1);
-          } catch {}
+          try { playerRef.current.setPlaybackRate(1); } catch {}
         },
       },
     });
@@ -342,60 +347,39 @@ export default function App() {
     saveDataset(data);
   }, [activeId, segments, knownWords, windowSec]);
 
-  /** 未知語リスト（自動で次へ＝常にtrue） */
-  const unknownWords = useMemo(
-    () =>
-      segments.filter(
-        (s) => !knownWords[s.word ? s.word : `t=${s.start}`]
-      ),
-    [segments, knownWords]
+  /** 既知判定ヘルパ */
+  const isKnown = (s: Segment) =>
+    !!knownWords[s.word ? s.word : `t=${s.start}`];
+
+  /** 表示リスト（トグル適用） */
+  const visibleSegments = useMemo(
+    () => (unknownOnly ? segments.filter((s) => !isKnown(s)) : segments),
+    // knownWords の変化を正しく伝えるため、シリアライズを依存に
+    [segments, JSON.stringify(knownWords), unknownOnly]
   );
 
-  /** 指定秒へジャンプ */
-  const playAtTime = (t: number) => {
-    if (!playerRef.current) return;
-    try {
-      playerRef.current.setPlaybackRate(1);
-    } catch {}
-    playerRef.current.seekTo(t, true);
-    playerRef.current.playVideo();
-  };
-
-  /** 未知語だけ順送りループ再生（自動進行） */
+  /** 可視リスト上の index から連続再生（各区間1回） */
   const playSequenceFrom = (index: number) => {
-    const list = unknownWords;
-    if (!playerRef.current || index < 0 || index >= list.length) return;
-    const seg = list[index];
-    currentRef.current = { idx: index, loop: 0 };
-    try {
-      playerRef.current.setPlaybackRate(1);
-    } catch {}
+    if (!playerRef.current || index < 0 || index >= visibleSegments.length)
+      return;
+    const seg = visibleSegments[index];
+    try { playerRef.current.setPlaybackRate(1); } catch {}
+    currentRef.current = { idx: index };
     playerRef.current.seekTo(seg.start, true);
     playerRef.current.playVideo();
     clearInterval(pollingRef.current);
+    const END_EPS = 0.01; // 浮動小数誤差逃げ
     pollingRef.current = setInterval(() => {
       const cur = currentRef.current;
       if (!cur) return;
       const t = playerRef.current?.getCurrentTime?.() ?? 0;
-      if (t >= seg.end) {
-        cur.loop += 1;
-        if (cur.loop < loops) {
-          playerRef.current.seekTo(seg.start, true);
-          playerRef.current.playVideo();
-        } else {
-          clearInterval(pollingRef.current);
-          pollingRef.current = null;
-          // 常に自動で次へ
-          playSequenceFrom(index + 1);
-        }
+      if (t >= seg.end - END_EPS) {
+        clearInterval(pollingRef.current);
+        pollingRef.current = null;
+        // 各区間1回のみ → 次へ
+        playSequenceFrom(index + 1);
       }
     }, 120);
-  };
-
-  /** 再生制御（シンプル化：未習を再生のみ） */
-  const handlePlayUnknown = () => {
-    if (unknownWords.length === 0) return;
-    playSequenceFrom(0);
   };
 
   /** ✅ 既知トグル（既知⇄未知） */
@@ -539,9 +523,9 @@ export default function App() {
                   <li>1行目に動画URL/ID、2行目にヘッダ（例：<code>秒数,見出し語,習熟度</code>）、3行目以降にデータを記述。</li>
                   <li>見出し語は空でもOK。習熟度は空白=0(未習)／1(既知)。</li>
                   <li>アップ後、一覧の行をタップ → 確認で学習開始。</li>
-                  <li>学習画面下の一覧で単語名をタップすると、その位置へジャンプします。</li>
-                  <li>「知ってる」ボタンで未知⇄既知を切替できます。</li>
-                  <li>未習のみを自動で順送り再生します（各単語のループ回数は設定可能）。</li>
+                  <li>学習画面下の一覧で単語名をタップすると、その位置から<strong>自動で次へ</strong>進みます（各区間は1回ずつ）。</li>
+                  <li>上部トグルで「<strong>すべて/未習のみ</strong>」を切替できます（表示と再生の対象に反映）。</li>
+                  <li>「知ってる」ボタンで既知⇄未知を切替できます。</li>
                   <li>保存はブラウザのローカルストレージを利用します。</li>
                 </ul>
                 <p className="text-xs text-gray-500">
@@ -559,65 +543,48 @@ export default function App() {
         {/* 学習時の操作群（videoモードのみ表示） */}
         {topMode === "video" && (
           <>
-            <div className="mt-4 grid grid-cols-3 gap-2 items-end">
-              <div>
-                <label className="block text-sm">ループ回数/単語</label>
-                <input
-                  type="number"
-                  min={1}
-                  value={loops}
-                  onChange={(e) =>
-                    setLoops(
-                      Math.max(1, parseInt(e.target.value || "1", 10))
-                    )
-                  }
-                  className="w-full border rounded-xl px-3 py-2"
-                />
+            {/* ▼ ループ回数/単語を削除。代わりにトグルのみ */}
+            <div className="mt-4 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-gray-600">表示・再生対象</span>
+                <button
+                  className="rounded-full border px-3 py-1 text-sm bg-white"
+                  onClick={() => setUnknownOnly(!unknownOnly)}
+                  title="すべて⇔未習のみ"
+                >
+                  {unknownOnly ? "未習のみ" : "すべて"}
+                </button>
               </div>
-              <div />
-              <div className="flex items-end justify-end">
-                {/* 右側余白（今後の拡張用） */}
-              </div>
-            </div>
-
-            <div className="mt-3 grid grid-cols-3 gap-2">
-              <button
-                className="rounded-2xl py-3 bg-black text-white"
-                onClick={handlePlayUnknown}
-              >
-                未習を再生
-              </button>
-              {/* ▼ 「前へ」「次へ」「一時停止」ボタンを削除しました */}
-              <div className="col-span-2" />
             </div>
 
             {/* Words list → 2列（左=単語名 / 右=知ってる） */}
             <div className="mt-6">
               <div className="flex items-center justify-between mb-2">
                 <div className="text-sm text-gray-600">
-                  総単語 {segments.length} ／ 既知 {knownCount}
+                  表示 {visibleSegments.length} ／ 総単語 {segments.length} ／ 既知 {knownCount}
                 </div>
               </div>
 
               <div className="border rounded-xl overflow-hidden">
                 {/* header row */}
                 <div className="grid grid-cols-[1fr_auto] gap-2 bg-gray-50 px-3 py-2 text-xs text-gray-500">
-                  <div className="text-left">単語名</div>
+                  <div className="text-left">単語名（タップでこの位置から連続再生）</div>
                   <div className="text-right">知ってる</div>
                 </div>
 
                 <div className="max-h-80 overflow-auto divide-y">
-                  {segments.map((seg, idx) => {
+                  {visibleSegments.map((seg, idx) => {
                     const key = seg.word || `t=${seg.start}`;
                     const known = !!knownWords[key];
                     return (
                       <div
-                        key={idx}
+                        key={key + ":" + idx}
                         className="grid grid-cols-[1fr_auto] items-center gap-2 px-3 py-2"
                       >
                         <button
                           className="text-left text-sm truncate"
-                          onClick={() => playAtTime(seg.start)}
+                          onClick={() => playSequenceFrom(idx)}
+                          title="この位置から自動で次へ進みます"
                         >
                           {seg.word || ""}
                         </button>
@@ -635,6 +602,11 @@ export default function App() {
                       </div>
                     );
                   })}
+                  {visibleSegments.length === 0 && (
+                    <div className="px-3 py-4 text-sm text-gray-500">
+                      対象の項目がありません（トグルや既知状態を確認してください）。
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
