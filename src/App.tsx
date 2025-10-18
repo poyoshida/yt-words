@@ -114,7 +114,6 @@ const parseUploadedCSV = (text: string, windowSec: number) => {
     const w = r.word || `t=${r.t}`;
     if (r.level === 1) known[w] = true;
   });
-
   return { videoId, segments, known };
 };
 
@@ -194,7 +193,6 @@ export default function App() {
   const [videoId, setVideoId] = useState("");
   const [segments, setSegments] = useState<Segment[]>([]);
   const [knownWords, setKnownWords] = useState<Record<string, boolean>>({});
-  const [pipSupported, setPipSupported] = useState(false);
 
   // 表示・再生対象のトグル：true=未習のみ / false=すべて
   const [unknownOnly, setUnknownOnly] = useState<boolean>(true);
@@ -209,7 +207,6 @@ export default function App() {
   useEffect(() => {
     ensureMaterialSymbols();
     loadYouTubeAPI();
-    setPipSupported(!!(document as any).pictureInPictureEnabled);
     setDatasetList(loadIndex());
   }, []);
 
