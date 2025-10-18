@@ -26,21 +26,38 @@ const loadYouTubeAPI = () => {
 };
 
 /** 型 */
+interface WordRow {
+  t: number;         // 開始秒
+  word: string;      // 見出し語（空でもOK）
+  level: 0 | 1;      // 0=未習, 1=既知
+}
 interface Segment {
-  word: string; // 単語名（空でもOK）
-  start: number; // 秒
-  end: number;   // 秒（次の開始時刻 - EPS or フォールバック）
+  start: number;
+  end: number;       // 次の開始 - EPS or フォールバック
+  word: string;
+  level: 0 | 1;      // 該当 WordRow の level を持たせる
 }
 interface DatasetMeta {
   id: string;
-  title: string; // YouTube動画タイトル（自動取得）
+  title: string;     // YouTube動画タイトル（自動取得）
   createdAt: number;
 }
-interface DatasetData {
+interface DatasetDataV2 {
+  schema: 2;
   id: string;
   title: string;
   videoId: string;
-  segments: Segment[];
+  words: WordRow[];  // ← 保存はこれだけ（+メタ）
+  windowSec: number;
+  createdAt: number;
+}
+// 互換読み取り用（旧）
+interface LegacySegment { word: string; start: number; end: number; }
+interface DatasetDataLegacy {
+  id: string;
+  title: string;
+  videoId: string;
+  segments: LegacySegment[];
   known: Record<string, boolean>; // key: word||t=sec
   windowSec: number;
   createdAt: number;
@@ -68,9 +85,11 @@ const parseTime = (raw: string): number => {
  *  2行目: 列名（例: 秒数,見出し語,習熟度）
  *  3行目以降: 秒数,見出し語(任意),習熟度(空白=0)
  *
- * 変更点：end は「次の行の開始秒 - 0.05s」。最終行のみ windowSec（最小 0.3s）でフォールバック。
+ * 保存は words（t, word, level）のみ。end は保存しない。
  */
-const parseUploadedCSV = (text: string, windowSec: number) => {
+const parseUploadedCSV = (
+  text: string
+): { videoId: string; words: WordRow[] } => {
   const BOM = String.fromCharCode(65279);
   const lines = text
     .split(/\r?\n/)
@@ -85,36 +104,23 @@ const parseUploadedCSV = (text: string, windowSec: number) => {
     throw new Error("1行目に有効なYouTube URL/IDを入力してください。");
 
   const dataLines = cleaned.slice(2);
-  const rows: { t: number; word: string; level: number }[] = [];
+  const words: WordRow[] = [];
   for (const line of dataLines) {
     const parts = line.split(/,|\t/).map((s) => s.trim());
     if (!parts[0]) continue; // 秒数必須
     const t = parseTime(parts[0]);
     const word = (parts[1] || ``).trim();
     const lvlRaw = (parts[2] ?? "").trim();
-    const level = lvlRaw === "" ? 0 : parseInt(lvlRaw, 10) ? 1 : 0; // 空白→0, 二値0/1
+    const level: 0 | 1 = (lvlRaw === "" ? 0 : parseInt(lvlRaw, 10) ? 1 : 0) as
+      | 0
+      | 1;
     if (!Number.isFinite(t)) continue;
-    rows.push({ t, word, level });
+    words.push({ t, word, level });
   }
 
-  rows.sort((a, b) => a.t - b.t);
-
-  const EPS = 0.05;
-  const segments: Segment[] = rows.map((r, i) => {
-    const start = r.t;
-    const nextStart = rows[i + 1]?.t;
-    const end = Number.isFinite(nextStart)
-      ? Math.max(start, (nextStart as number) - EPS)
-      : start + Math.max(0.3, windowSec);
-    return { word: r.word || ``, start, end };
-  });
-
-  const known: Record<string, boolean> = {};
-  rows.forEach((r) => {
-    const w = r.word || `t=${r.t}`;
-    if (r.level === 1) known[w] = true;
-  });
-  return { videoId, segments, known };
+  // 時刻でソート
+  words.sort((a, b) => a.t - b.t);
+  return { videoId, words };
 };
 
 /** URL/ID → videoId */
@@ -123,8 +129,7 @@ const extractVideoId = (urlOrId: string): string => {
   if (/^[a-zA-Z0-9_-]{11}$/.test(s)) return s;
   try {
     const u = new URL(s);
-    if (u.hostname.includes("youtu.be"))
-      return u.pathname.replace("/", "");
+    if (u.hostname.includes("youtu.be")) return u.pathname.replace("/", "");
     if (u.searchParams.get("v")) return u.searchParams.get("v") || "";
   } catch {}
   return s;
@@ -145,7 +150,8 @@ const fetchVideoTitle = async (videoId: string): Promise<string> => {
 
 /** LocalStorage helpers */
 const INDEX_KEY = "yt-word-loop:index";
-const DS_KEY = (id: string) => `yt-word-loop:ds:${id}`;
+const DS_KEY = (id: string) => `yt-word-loop:ds:${id}`; // データ本体
+
 const loadIndex = (): DatasetMeta[] => {
   try {
     const raw = localStorage.getItem(INDEX_KEY);
@@ -159,12 +165,14 @@ const saveIndex = (list: DatasetMeta[]) => {
     localStorage.setItem(INDEX_KEY, JSON.stringify(list));
   } catch {}
 };
-const saveDataset = (ds: DatasetData) => {
+const saveDataset = (ds: DatasetDataV2) => {
   try {
     localStorage.setItem(DS_KEY(ds.id), JSON.stringify(ds));
   } catch {}
 };
-const loadDataset = (id: string): DatasetData | null => {
+const loadDatasetAny = (
+  id: string
+): DatasetDataV2 | DatasetDataLegacy | null => {
   try {
     const raw = localStorage.getItem(DS_KEY(id));
     return raw ? JSON.parse(raw) : null;
@@ -179,6 +187,22 @@ const deleteDataset = (id: string) => {
 };
 const rid = () => Math.random().toString(36).slice(2, 10);
 
+/** words → segments をメモリ上で構築 */
+const makeSegments = (words: WordRow[], windowSec: number): Segment[] => {
+  if (!words.length) return [];
+  const EPS = 0.05;
+  const sorted = [...words].sort((a, b) => a.t - b.t);
+  const segs: Segment[] = sorted.map((w, i) => {
+    const start = w.t;
+    const nextStart = sorted[i + 1]?.t;
+    const end = Number.isFinite(nextStart)
+      ? Math.max(start, (nextStart as number) - EPS)
+      : start + Math.max(0.3, windowSec);
+    return { start, end, word: w.word || "", level: w.level };
+  });
+  return segs;
+};
+
 /** 16:9トップエリアのモード */
 type TopMode = "select" | "help" | "video";
 
@@ -191,8 +215,8 @@ export default function App() {
   /** 再生関連 */
   const [activeId, setActiveId] = useState<string | null>(null);
   const [videoId, setVideoId] = useState("");
-  const [segments, setSegments] = useState<Segment[]>([]);
-  const [knownWords, setKnownWords] = useState<Record<string, boolean>>({});
+  const [words, setWords] = useState<WordRow[]>([]); // ← 保存の主役
+  const segments = useMemo(() => makeSegments(words, windowSec), [words, windowSec]);
 
   // 表示・再生対象のトグル：true=未習のみ / false=すべて
   const [unknownOnly, setUnknownOnly] = useState<boolean>(true);
@@ -242,7 +266,7 @@ export default function App() {
     return () => clearInterval(tm);
   }, [topMode, videoId]);
 
-  /** アップロード（CSV） */
+  /** アップロード（CSV）→ 保存は words のみ */
   const onUploadClicked = () => csvFileInput.current?.click();
 
   const handleUpload: React.ChangeEventHandler<HTMLInputElement> = async (e) => {
@@ -252,19 +276,16 @@ export default function App() {
     reader.onload = async () => {
       try {
         const text = String(reader.result || "");
-        const { videoId: vid, segments: segs, known } = parseUploadedCSV(
-          text,
-          windowSec
-        );
+        const { videoId: vid, words } = parseUploadedCSV(text);
         const id = rid();
         const title = await fetchVideoTitle(vid);
         const meta: DatasetMeta = { id, title, createdAt: Date.now() };
-        const data: DatasetData = {
+        const data: DatasetDataV2 = {
+          schema: 2,
           id,
           title,
           videoId: vid,
-          segments: segs,
-          known,
+          words,
           windowSec,
           createdAt: meta.createdAt,
         };
@@ -280,34 +301,62 @@ export default function App() {
     e.currentTarget.value = "";
   };
 
-  /** 学習開始 */
+  /** 学習開始（旧スキーマは自動移行） */
+  const migrateLegacy = (legacy: DatasetDataLegacy): DatasetDataV2 => {
+    const words: WordRow[] = legacy.segments
+      .sort((a, b) => a.start - b.start)
+      .map((s) => {
+        const key = s.word || `t=${s.start}`;
+        const lvl: 0 | 1 = legacy.known?.[key] ? 1 : 0;
+        return { t: s.start, word: s.word || "", level: lvl };
+      });
+    return {
+      schema: 2,
+      id: legacy.id,
+      title: legacy.title,
+      videoId: legacy.videoId,
+      words,
+      windowSec: legacy.windowSec || 1.8,
+      createdAt: legacy.createdAt,
+    };
+  };
+
   const startLearning = (id: string) => {
-    const data = loadDataset(id);
-    if (!data) return;
-    setActiveId(id);
-    setVideoId(data.videoId);
-    setSegments(data.segments);
-    setKnownWords(data.known || {});
-    setWindowSec(data.windowSec || 1.8);
+    const raw = loadDatasetAny(id);
+    if (!raw) return;
+
+    let v2: DatasetDataV2;
+    if ((raw as any).schema === 2) {
+      v2 = raw as DatasetDataV2;
+    } else {
+      v2 = migrateLegacy(raw as DatasetDataLegacy);
+      saveDataset(v2); // 上書き保存（自動移行）
+    }
+
+    setActiveId(v2.id);
+    setVideoId(v2.videoId);
+    setWords(v2.words || []);
+    setWindowSec(v2.windowSec || 1.8);
     setTopMode("video");
   };
 
   /** ダウンロード（保存） */
   const downloadCSV = (id: string) => {
-    const data = loadDataset(id);
-    if (!data) return;
-    const url = data.videoId
-      ? `https://www.youtube.com/watch?v=${data.videoId}`
-      : "";
+    const raw = loadDatasetAny(id);
+    if (!raw) return;
+
+    // 旧 → 移行してから出力
+    const v2 = (raw as any).schema === 2 ? (raw as DatasetDataV2) : migrateLegacy(raw as DatasetDataLegacy);
+
+    const url = v2.videoId ? `https://www.youtube.com/watch?v=${v2.videoId}` : "";
     const lines: string[] = [];
     lines.push(url);
     lines.push("秒数,見出し語,習熟度");
-    const masteryOf = (w: string) => (data.known[w] ? 1 : 0);
-    data.segments.forEach((seg) => {
-      lines.push(`${seg.start},${seg.word || ""},${masteryOf(seg.word)}`);
+    v2.words.forEach((w) => {
+      lines.push(`${w.t},${w.word || ""},${w.level}`);
     });
     const csvText = lines.join("\n");
-    const filename = `${data.title || "dataset"}-${data.id}.csv`;
+    const filename = `${v2.title || "dataset"}-${v2.id}.csv`;
     const blob = new Blob([csvText], { type: "text/csv;charset=utf-8" });
     const urlObj = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -327,32 +376,26 @@ export default function App() {
     if (activeId === id) {
       setActiveId(null);
       setVideoId("");
-      setSegments([]);
-      setKnownWords({});
+      setWords([]);
       setTopMode("select");
     }
   };
 
-  /** 進捗の永続化 */
+  /** 進捗の永続化（activeId の words を都度保存） */
   useEffect(() => {
     if (!activeId) return;
-    const data = loadDataset(activeId);
-    if (!data) return;
-    data.segments = segments;
-    data.known = knownWords;
-    data.windowSec = windowSec;
-    saveDataset(data);
-  }, [activeId, segments, knownWords, windowSec]);
-
-  /** 既知判定ヘルパ */
-  const isKnown = (s: Segment) =>
-    !!knownWords[s.word ? s.word : `t=${s.start}`];
+    const raw = loadDatasetAny(activeId);
+    if (!raw) return;
+    const v2 = (raw as any).schema === 2 ? (raw as DatasetDataV2) : migrateLegacy(raw as DatasetDataLegacy);
+    v2.words = words;
+    v2.windowSec = windowSec;
+    saveDataset(v2);
+  }, [activeId, words, windowSec]);
 
   /** 表示リスト（トグル適用） */
   const visibleSegments = useMemo(
-    () => (unknownOnly ? segments.filter((s) => !isKnown(s)) : segments),
-    // knownWords の変化を正しく伝えるため、シリアライズを依存に
-    [segments, JSON.stringify(knownWords), unknownOnly]
+    () => (unknownOnly ? segments.filter((s) => s.level === 0) : segments),
+    [segments, unknownOnly]
   );
 
   /** 可視リスト上の index から連続再生（各区間1回） */
@@ -379,14 +422,18 @@ export default function App() {
     }, 120);
   };
 
-  /** ✅ 既知トグル（既知⇄未知） */
-  const toggleKnown = (w: string) => {
-    setKnownWords((prev) => ({ ...prev, [w]: !prev[w] }));
+  /** 既知トグル（WordRow を直接更新） */
+  const toggleKnownByStart = (start: number) => {
+    setWords((prev) =>
+      prev.map((w) =>
+        w.t === start ? { ...w, level: w.level ? 0 : 1 } : w
+      )
+    );
   };
 
   const knownCount = useMemo(
-    () => Object.values(knownWords).filter(Boolean).length,
-    [knownWords]
+    () => words.reduce((acc, w) => acc + (w.level ? 1 : 0), 0),
+    [words]
   );
 
   /** UI */
@@ -540,7 +587,7 @@ export default function App() {
         {/* 学習時の操作群（videoモードのみ表示） */}
         {topMode === "video" && (
           <>
-            {/* ▼ ループ回数/単語を削除。代わりにトグルのみ */}
+            {/* トグル（すべて/未習のみ） */}
             <div className="mt-4 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <span className="text-sm text-gray-600">表示・再生対象</span>
@@ -571,11 +618,10 @@ export default function App() {
 
                 <div className="max-h-80 overflow-auto divide-y">
                   {visibleSegments.map((seg, idx) => {
-                    const key = seg.word || `t=${seg.start}`;
-                    const known = !!knownWords[key];
+                    const known = seg.level === 1;
                     return (
                       <div
-                        key={key + ":" + idx}
+                        key={`${seg.start}:${idx}`}
                         className="grid grid-cols-[1fr_auto] items-center gap-2 px-3 py-2"
                       >
                         <button
@@ -589,7 +635,7 @@ export default function App() {
                           className={`w-9 h-9 rounded-full border flex items-center justify-center ${
                             known ? "bg-gray-100" : "bg-amber-100"
                           }`}
-                          onClick={() => toggleKnown(key)}
+                          onClick={() => toggleKnownByStart(seg.start)}
                           title={known ? "未知に戻す" : "知ってるにする"}
                         >
                           <span className="material-symbols-outlined text-[18px]">
